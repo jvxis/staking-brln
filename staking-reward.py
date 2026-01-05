@@ -202,6 +202,141 @@ def get_monthly_total_from_audit(audit_path: str, now_local: Optional[dt.datetim
         logger.warning("Falha ao ler total mensal do audit: %s", e)
     return total
 
+def _iter_summary_entries(audit_path: str):
+    if not os.path.isfile(audit_path):
+        return
+    try:
+        with open(audit_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("action") != "summary":
+                    continue
+                run_id = obj.get("run_id") or obj.get("ts")
+                ts = _parse_iso_utc_z(run_id) if run_id else None
+                if not ts:
+                    continue
+                yield ts.astimezone(LOCAL_TZ), obj
+    except Exception as e:
+        logger.warning("Falha ao ler audit: %s", e)
+
+def get_period_totals_from_audit(
+    audit_path: str,
+    reference_local: Optional[dt.datetime] = None,
+) -> Dict[str, int]:
+    totals = {"prev_year": 0, "prev_month": 0, "cur_month": 0, "cur_year": 0}
+    if reference_local is None:
+        reference_local = dt.datetime.now(tz=LOCAL_TZ)
+    cur_year = reference_local.year
+    cur_month = reference_local.month
+    prev_year = cur_year - 1
+    prev_month_year = cur_year - 1 if cur_month == 1 else cur_year
+    prev_month = 12 if cur_month == 1 else cur_month - 1
+
+    for ts_local, obj in _iter_summary_entries(audit_path):
+        distributed = int(obj.get("distributed_sats", 0) or 0)
+        if ts_local.year == cur_year:
+            totals["cur_year"] += distributed
+            if ts_local.month == cur_month:
+                totals["cur_month"] += distributed
+        if ts_local.year == prev_year:
+            totals["prev_year"] += distributed
+        if ts_local.year == prev_month_year and ts_local.month == prev_month:
+            totals["prev_month"] += distributed
+
+    return totals
+
+def _normalize_result_pos(value: Any, fallback: int) -> int:
+    try:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    except Exception:
+        pass
+    return fallback
+
+def build_staking_results_message(
+    summary: Dict[str, Any],
+    audit_path: str,
+    reference_local: Optional[dt.datetime] = None,
+) -> str:
+    results = summary.get("results")
+    if not isinstance(results, list):
+        results = []
+
+    top_n = summary.get("top_n")
+    try:
+        top_n = int(top_n)
+    except Exception:
+        top_n = max(len(results), 10) if results else 10
+
+    if reference_local is None:
+        run_id = summary.get("run_id")
+        run_ts = _parse_iso_utc_z(run_id) if run_id else None
+        reference_local = run_ts.astimezone(LOCAL_TZ) if run_ts else dt.datetime.now(tz=LOCAL_TZ)
+
+    data_str = reference_local.strftime("%d/%m")
+    title = f"\U0001F3C6 BRLN Staking \U0001F947 TOP {top_n} Stakers - Resultado do dia {data_str}"
+
+    dry_run = summary.get("dry_run")
+    if dry_run is None:
+        dry_run = any(isinstance(r, dict) and r.get("status") == "dry-run" for r in results)
+
+    lines = [title, ""]
+    if dry_run:
+        lines.append("\u26a0\ufe0f <b>SIMULACAO (DRY-RUN)</b> \U0001F62C Nenhum pagamento foi efetuado.")
+        lines.append("")
+
+    if dry_run:
+        contemplados = results
+    else:
+        contemplados = [r for r in results if isinstance(r, dict) and r.get("status") == "paid"]
+
+    if contemplados:
+        entries = []
+        for idx, r in enumerate(contemplados, 1):
+            pos = _normalize_result_pos(r.get("pos"), idx)
+            entries.append((pos, r))
+        entries.sort(key=lambda item: item[0] if isinstance(item[0], int) else 99999)
+        for pos, r in entries:
+            u = r.get("user", "unknown")
+            s = r.get("share", 0)
+            try:
+                s_int = int(s)
+            except Exception:
+                s_int = 0
+            pos_label = pos if isinstance(pos, int) else "?"
+            lines.append(f"{pos_label}\u00ba \U0001F947 <code>{u}</code> \U0001F4B0 {fmt_sat(s_int)} sats")
+    else:
+        lines.append("Nenhum contemplado hoje.")
+
+    totals = get_period_totals_from_audit(audit_path, reference_local)
+    prev_month_dt = reference_local.replace(day=1) - dt.timedelta(days=1)
+    prev_month_name = prev_month_dt.strftime("%B").capitalize()
+    cur_month_name = reference_local.strftime("%B").capitalize()
+    prev_year = reference_local.year - 1
+    cur_year = reference_local.year
+
+    lines.append("")
+    lines.append(f"\U0001F4C8 Total pago no ano {prev_year}: <b>{fmt_sat(int(totals.get('prev_year', 0)))} sats</b>")
+    lines.append(
+        f"\U0001F4C5 Total pago em {prev_month_name} {prev_month_dt.year}: "
+        f"<b>{fmt_sat(int(totals.get('prev_month', 0)))} sats</b>"
+    )
+    lines.append(f"\U0001F4C5 Total pago em {cur_month_name}: <b>{fmt_sat(int(totals.get('cur_month', 0)))} sats</b>")
+    lines.append(f"\U0001F4C8 Total pago no ano {cur_year}: <b>{fmt_sat(int(totals.get('cur_year', 0)))} sats</b>")
+
+    return "\n".join(lines)
+
+
 
 # =======================
 # lncli (fees últimos N h)
@@ -649,8 +784,10 @@ def compute_and_distribute(
         user_key = a["user_key"]
         share = int(a["share"])
         wallets_of_user = a["info"]["wallets"]
+        pos = pos_map.get(user_key, "?")
+        pos_val = pos if isinstance(pos, int) else None
         if share <= 0 or not wallets_of_user:
-            results.append({"user": user_key, "share": share, "status": "skipped"})
+            results.append({"user": user_key, "share": share, "status": "skipped", "pos": pos_val})
             continue
 
         # carteira destino = de MAIOR saldo
@@ -684,16 +821,16 @@ def compute_and_distribute(
             })
             logger.info("[DRY-RUN] Criaria invoice (%s sats) com memo='%s', inkey=%s e pagaria via fund_admin_key=%s",
                         fmt_sat(share), memo, mask_key(target_inkey), mask_key(fund_admin_key or ""))
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "dry-run"})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "dry-run", "pos": pos_val})
             continue
 
         if not fund_admin_key:
             logger.error("Sem --fund-admin-key; impossível pagar invoice.")
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "missing_fund_admin_key"})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "missing_fund_admin_key", "pos": pos_val})
             continue
         if not target_inkey:
             logger.error("Wallet destino sem inkey; impossível gerar invoice.")
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "missing_inkey"})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "missing_inkey", "pos": pos_val})
             continue
 
         # (1) criar invoice com INKEY da wallet destino
@@ -705,13 +842,13 @@ def compute_and_distribute(
         })
         if not ok_inv or not isinstance(inv_obj.get("resp"), dict):
             logger.error("Falha ao criar invoice (inkey). Resp=%s", inv_obj)
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "invoice_failed", "resp": inv_obj})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "invoice_failed", "resp": inv_obj, "pos": pos_val})
             continue
 
         pr = inv_obj["resp"].get("payment_request")
         if not pr or not isinstance(pr, str) or not pr.startswith("ln"):
             logger.error("Invoice sem payment_request válido: %s", inv_obj["resp"])
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "invoice_no_pr"})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "invoice_no_pr", "pos": pos_val})
             continue
 
         # (2) pagar invoice com ADMKEY da carteira de funding
@@ -724,10 +861,10 @@ def compute_and_distribute(
         if ok_pay:
             logger.info("Pagamento OK user=%s amount=%s sat | payment_hash=%s",
                         user_key, fmt_sat(share), pay_obj["resp"].get("payment_hash"))
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "paid", "pay_resp": pay_obj})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "paid", "pay_resp": pay_obj, "pos": pos_val})
         else:
             logger.error("Falha no pagamento user=%s amount=%s sat resp=%s", user_key, fmt_sat(share), pay_obj)
-            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "pay_failed", "pay_resp": pay_obj})
+            results.append({"user": user_key, "wallet": target_wallet_id, "share": share, "status": "pay_failed", "pay_resp": pay_obj, "pos": pos_val})
         
 
     # 8) Sumário
@@ -743,6 +880,8 @@ def compute_and_distribute(
         "fees_window": {"start_ts": start_ts, "end_ts": end_ts},
         "total_fees_sats": total_fees_sats,
         "percent": percent_to_use,
+        "top_n": top_n,
+        "dry_run": dry_run,
         "fees_to_distribute": eligible_total,           # elegível pelo %
         "eligible_total_sats": eligible_total_sats,     # soma dos shares pós-arredondamento
         "distributed_sats": distributed,                # pagos de fato (0 em dry-run)
@@ -765,45 +904,11 @@ def compute_and_distribute(
     write_audit({"action": "summary", **summary})
     
     # ===== Saída Telegram (opcional) =====
-    contemplados = []
-    for r in results:
-        status = r.get("status")
-        if dry_run:
-            # Em dry-run, mostramos a simulação completa
-            contemplados.append(r)
-        else:
-            if status == "paid":
-                contemplados.append(r)
-
-    def _pos_of(uid: str):
-        return pos_map.get(uid, "?")
-
-    contemplados.sort(key=lambda x: _pos_of(x.get("user")) if isinstance(_pos_of(x.get("user")), int) else 99999)
-
-    agora_local = dt.datetime.now(tz=LOCAL_TZ)
-    data_str = agora_local.strftime("%d/%m")
-    titulo = "🏆 BR⚡LN Staking – TOP 10 Stakers - Resultado do dia " + data_str
-
-    linhas = [titulo, ""]
-    if dry_run:
-        linhas.append("⚠️ <b>SIMULAÇÃO (DRY-RUN)</b> – Nenhum pagamento foi efetuado.")
-        linhas.append("")
-
-    if contemplados:
-        for r in contemplados:
-            u = r.get("user", "unknown")
-            s = r.get("share", 0)
-            pos = _pos_of(u)
-            linhas.append(f"{pos}º — <code>{u}</code> • {fmt_sat(int(s))} sats")
-    else:
-        linhas.append("Nenhum contemplado hoje.")
-
-    total_mes = get_monthly_total_from_audit(AUDIT_FILE, agora_local)
-    mes_ext = agora_local.strftime("%B").capitalize()
-    linhas.append("")
-    linhas.append(f"📅 Total pago em {mes_ext}: <b>{fmt_sat(int(total_mes))} sats</b>")
-
-    msg = "\n".join(linhas)
+    msg = build_staking_results_message(
+        summary,
+        audit_path=AUDIT_FILE,
+        reference_local=dt.datetime.now(tz=LOCAL_TZ),
+    )
 
     if telegram_token and telegram_chat:
         send_telegram_message(telegram_token, telegram_chat, msg)
@@ -851,7 +956,7 @@ if __name__ == "__main__":
             exclude_user_id=args.exclude_user_id,
             debug_api=args.debug_api,
             telegram_token=args.telegram_token,
-            telegram_chat=args.telegram_chat
+            telegram_chat=args.telegram_chat,
         )
     except Exception as e:
         logger.exception("Erro não tratado: %s", e)
